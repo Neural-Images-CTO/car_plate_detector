@@ -1,0 +1,6 @@
+opencv-python>=4.8.0
+ultralytics>=8.4.0
+easyocr>=1.7.0
+huggingface_hub>=0.20.0
+torch>=2.0.0
+torchvision>=0.15.0

@@ -1,0 +1,14 @@
+name: local_alpr
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - opencv-python>=4.8.0
+      - ultralytics>=8.4.0
+      - easyocr>=1.7.0
+      - huggingface_hub>=0.20.0
+      # Install GPU PyTorch separately after env create:
+      # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
