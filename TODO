@@ -1,3 +1,36 @@
 run using camera tuning
+
+________________
+
 remove spaces from plate numbers
+
+________________
+
 enhance OCR Stabilization?
+
+________________
+
+These are ordered by impact vs. effort.
+
+________________
+
+Fix the tracker key (bug / design flaw)
+PlateTracker keys history by exact pixel coordinates (x1, y1, x2, y2):
+
+    def update(self, box: tuple[int, int, int, int], text: str) -> str:
+        key = box
+        if key not in self._history:
+            self._history[key] = deque(maxlen=self._window)
+        if text:
+            self._history[key].append(text)
+        votes = self._history[key]
+        if not votes:
+            return ""
+        return Counter(votes).most_common(1)[0][0]
+If the box moves even 1 pixel between frames, you get a new key and voting resets. Better: IoU matching, centroid distance, or a simple object tracker (ByteTrack, SORT).
+
+________________
+
+future enhancements:
+see docs\roi-motion-gating.md
+
