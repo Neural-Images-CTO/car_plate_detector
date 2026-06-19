@@ -6,6 +6,23 @@
 
 11/6 22:00-22:30: solving technical issue with git permissions for Shada
 
+15/6 22:00-23:00: thinking about how to enhance the model
+
+16/6 22:00-23:30: enhance stablizor by matching boxes using IoU (Intersection over Union) — a measure of how much two boxes overlap. If two boxes from consecutive frames overlap significantly (e.g. IoU > 0.4), they're considered the same plate, even if the coordinates shifted.
+
+19/6 21:30-22:30: implemented evidence capture — saves plate crop + full frame images per detection event, per-event detections_log.csv with yolo_conf, ocr_conf, and image paths. Added --save-evidence, --evidence-dir, --detections-csv, --max-captures CLI flags.
+
+19/6 22:30-23:00: reviewed vehicle detection + tracking enhancement proposal (3 stages: fix tracker key, ByteTrack, two-model pipeline). Documented in VEHICLE_TRACKING_ENHANCEMENT.md and added to TODO.
+
+20/6 00:00-00:30: implemented plate crop preprocessing (upscale + bilateral filter + CLAHE contrast enhancement). Runs OCR on both raw and preprocessed crop, picks higher confidence. Added --preprocess CLI flag (off by default).
+
+20/6 00:30-01:00: reviewed CSRT motion tracking + conditional OCR proposal. Documented in CSRT_MOTION_TRACKING.md, updated VEHICLE_TRACKING_ENHANCEMENT.md and TODO. Reviewed perspective correction proposal, documented in PERSPECTIVE_CORRECTION.md.
+
+20/6 01:00-01:15: implemented confidence-weighted voting in PlateTracker — instead of majority vote by count, sums OCR confidence scores per candidate text and picks the highest-scoring one.
+
+20/6 01:15-01:30: implemented pluggable OCR engine abstraction — OcrEngine protocol with EasyOcrEngine and PaddleOcrEngine adapters. Added --ocr-engine CLI flag (easyocr default, paddle optional). Updated README.
+
+20/6 1:30-2:00: trying to run with ocrpaddle
 
 
 

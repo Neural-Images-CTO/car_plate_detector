@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Local Automatic License Plate Recognition (ALPR) using YOLOv8 + EasyOCR.
+Local Automatic License Plate Recognition (ALPR) using YOLOv8 + pluggable OCR.
 
 Supports webcam/camera (integer source), static images, and video files.
+OCR engine is selectable via --ocr-engine: easyocr (default) or paddle.
 """
 
 from __future__ import annotations
@@ -12,13 +13,13 @@ import csv
 import re
 import sys
 import time
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 import cv2
-import easyocr
 import torch
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
@@ -61,6 +62,15 @@ def clean_plate_text(raw: str) -> str:
     text = re.sub(r"[^A-Z0-9\- ]", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+@dataclass
+class Detection:
+    box: tuple[int, int, int, int]
+    text: str
+    yolo_conf: float
+    ocr_conf: float
+    crop: object  # numpy ndarray — not hashed/compared
 
 
 @dataclass
@@ -129,23 +139,224 @@ class PlateLog:
             print(f"CSV saved to: {self.csv_path.resolve()}")
 
 
+def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    """Intersection over Union for two (x1, y1, x2, y2) boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (area_a + area_b - inter)
+
+
 class PlateTracker:
-    """Stabilize OCR across frames using a short vote window (reduces camera flicker)."""
+    """Stabilize OCR across frames using IoU-based track matching and confidence-weighted voting.
 
-    def __init__(self, window: int = 5):
-        self._history: dict[tuple[int, int, int, int], deque[str]] = {}
+    Boxes are matched to existing tracks by IoU rather than exact coordinates,
+    so the vote history accumulates even as a car moves across the frame.
+    Each reading is stored with its OCR confidence; the winner is chosen by
+    summing confidence scores per candidate text rather than counting occurrences.
+    Tracks that have not been updated for `max_age` frames are expired.
+    """
+
+    def __init__(self, window: int = 5, iou_threshold: float = 0.4, max_age: int = 30):
+        self._history: dict[tuple[int, int, int, int], deque[tuple[str, float]]] = {}
+        self._last_seen: dict[tuple[int, int, int, int], int] = {}
         self._window = window
+        self._iou_threshold = iou_threshold
+        self._max_age = max_age
+        self._frame: int = 0
 
-    def update(self, box: tuple[int, int, int, int], text: str) -> str:
-        key = box
-        if key not in self._history:
+    def _find_matching_key(
+        self, box: tuple[int, int, int, int]
+    ) -> tuple[int, int, int, int] | None:
+        best_key, best_iou = None, self._iou_threshold
+        for key in self._history:
+            score = _iou(key, box)
+            if score > best_iou:
+                best_iou, best_key = score, key
+        return best_key
+
+    def _expire_old_tracks(self) -> None:
+        stale = [k for k, f in self._last_seen.items() if self._frame - f > self._max_age]
+        for k in stale:
+            del self._history[k]
+            del self._last_seen[k]
+
+    def update(self, box: tuple[int, int, int, int], text: str, conf: float = 0.0) -> str:
+        self._frame += 1
+        self._expire_old_tracks()
+
+        key = self._find_matching_key(box)
+        if key is None:
+            key = box
             self._history[key] = deque(maxlen=self._window)
-        if text:
-            self._history[key].append(text)
-        votes = self._history[key]
-        if not votes:
+
+        if text and conf > 0.0:
+            self._history[key].append((text, conf))
+        self._last_seen[key] = self._frame
+
+        entries = self._history[key]
+        if not entries:
             return ""
-        return Counter(votes).most_common(1)[0][0]
+
+        scores: dict[str, float] = {}
+        for t, c in entries:
+            scores[t] = scores.get(t, 0.0) + c
+        return max(scores, key=lambda t: scores[t])
+
+
+class EvidenceStore:
+    """Save plate crop + full frame images and append rows to a detections CSV.
+
+    One row is written per unique plate per frame. The summary CSV (PlateLog)
+    keeps an aggregate view; this table is the per-event evidence trail.
+    """
+
+    DETECTION_CSV_FIELDS = (
+        "detection_id",
+        "plate_number",
+        "timestamp",
+        "yolo_conf",
+        "ocr_conf",
+        "crop_path",
+        "frame_path",
+    )
+
+    def __init__(self, evidence_dir: Path, detections_csv: Path, max_captures: int = 0):
+        self._dir = evidence_dir
+        self._csv_path = detections_csv
+        self._max_captures = max_captures
+        self._detection_id = 0
+        self._seen_this_frame: set[str] = set()
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        self._init_csv()
+
+    def _init_csv(self) -> None:
+        if self._csv_path.exists():
+            return
+        self._csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._csv_path.open("w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=self.DETECTION_CSV_FIELDS).writeheader()
+
+    def begin_frame(self) -> None:
+        self._seen_this_frame.clear()
+
+    def save(
+        self,
+        det: Detection,
+        frame,
+    ) -> None:
+        if not det.text or det.text in self._seen_this_frame:
+            return
+        if self._max_captures > 0 and self._detection_id >= self._max_captures:
+            return
+
+        self._seen_this_frame.add(det.text)
+        self._detection_id += 1
+        now = datetime.now()
+        ts = now.strftime("%Y%m%d_%H%M%S")
+        safe_plate = re.sub(r"[^A-Z0-9]", "_", det.text)
+        det_id = self._detection_id
+
+        crop_name = f"{safe_plate}_{ts}_{det_id:04d}_crop.jpg"
+        frame_name = f"{safe_plate}_{ts}_{det_id:04d}_frame.jpg"
+        crop_path = self._dir / crop_name
+        frame_path = self._dir / frame_name
+
+        cv2.imwrite(str(crop_path), det.crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        with self._csv_path.open("a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=self.DETECTION_CSV_FIELDS).writerow(
+                {
+                    "detection_id": det_id,
+                    "plate_number": det.text,
+                    "timestamp": now.isoformat(timespec="seconds"),
+                    "yolo_conf": f"{det.yolo_conf:.3f}",
+                    "ocr_conf": f"{det.ocr_conf:.3f}",
+                    "crop_path": str(crop_path.resolve()),
+                    "frame_path": str(frame_path.resolve()),
+                }
+            )
+        print(f"[evidence] #{det_id} {det.text} → {crop_name}")
+
+
+class OcrEngine(Protocol):
+    """Common interface for OCR backends.
+
+    Each adapter wraps a specific OCR library and normalises its output to a
+    flat list of (text, confidence) pairs. All filtering, cleaning, and
+    preprocessing logic lives in `recognize_plate` and is engine-agnostic.
+    """
+
+    def read(self, img) -> list[tuple[str, float]]:
+        """Return (text, confidence) pairs found in img (any channel count)."""
+        ...
+
+
+class EasyOcrEngine:
+    """Adapter for EasyOCR. Imported lazily so PaddleOCR installs are optional."""
+
+    def __init__(self, languages: list[str], gpu: bool) -> None:
+        import easyocr  # noqa: PLC0415
+        print("Loading EasyOCR reader (first run may download models)...")
+        self._reader = easyocr.Reader(languages, gpu=gpu)
+
+    def read(self, img) -> list[tuple[str, float]]:
+        return [(text, float(conf)) for _bbox, text, conf in self._reader.readtext(img)]
+
+
+class PaddleOcrEngine:
+    """Adapter for PaddleOCR. Install with: pip install paddleocr paddlepaddle"""
+
+    def __init__(self, gpu: bool) -> None:
+        import os  # noqa: PLC0415
+        import logging  # noqa: PLC0415
+        # Force-disable OneDNN before Paddle initializes — it has a compatibility
+        # bug on some Windows PaddlePaddle builds.
+        os.environ["FLAGS_use_mkldnn"] = "0"
+        from paddleocr import PaddleOCR  # noqa: PLC0415
+        import paddle  # noqa: PLC0415
+        try:
+            paddle.set_flags({"FLAGS_use_mkldnn": False})
+        except Exception:
+            pass
+        logging.getLogger("ppocr").setLevel(logging.ERROR)
+        print("Loading PaddleOCR (first run may download models)...")
+        device = "gpu" if gpu else "cpu"
+        self._ocr = PaddleOCR(lang="en", use_textline_orientation=True, device=device)
+
+    def read(self, img) -> list[tuple[str, float]]:
+        try:
+            results = self._ocr.predict([img])  # predict() expects a batch (list of images)
+        except Exception as e:
+            print(f"[PaddleOCR] predict failed: {e}", file=__import__("sys").stderr)
+            return []
+        if not results:
+            return []
+        out: list[tuple[str, float]] = []
+        for batch in results:
+            if not batch:
+                continue
+            items = batch if isinstance(batch, list) else [batch]
+            for item in items:
+                try:
+                    if isinstance(item, dict):
+                        text = item.get("rec_text", "")
+                        conf = float(item.get("rec_score", 0.0))
+                    elif hasattr(item, "rec_text"):
+                        text = item.rec_text
+                        conf = float(item.rec_score)
+                    else:
+                        continue
+                    if text:
+                        out.append((text, conf))
+                except Exception:
+                    continue
+        return out
 
 
 def resolve_yolo_weights(model_arg: str) -> str:
@@ -163,9 +374,10 @@ def resolve_yolo_weights(model_arg: str) -> str:
 
 def init_models(
     yolo_weights: str,
+    ocr_engine_name: str,
     languages: list[str],
     use_gpu: bool,
-) -> tuple[YOLO, easyocr.Reader]:
+) -> tuple[YOLO, OcrEngine]:
     device = "cuda" if use_gpu and gpu_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -173,23 +385,66 @@ def init_models(
     print("Loading YOLO plate detector (first run may download weights)...")
     yolo = YOLO(weights_path)
 
-    print("Loading EasyOCR reader (first run may download models)...")
-    reader = easyocr.Reader(languages, gpu=use_gpu and gpu_available())
-    return yolo, reader
+    gpu = use_gpu and gpu_available()
+    if ocr_engine_name == "paddle":
+        engine: OcrEngine = PaddleOcrEngine(gpu=gpu)
+    else:
+        engine = EasyOcrEngine(languages=languages, gpu=gpu)
+
+    return yolo, engine
+
+
+def preprocess_plate(crop_bgr, target_h: int = 100):
+    """Upscale (if small), grayscale, denoise, and enhance contrast of a plate crop.
+
+    Returns a single-channel (grayscale) image ready for OCR.
+    Upscales only when the crop is shorter than target_h to avoid blowing up
+    large crops and slowing EasyOCR unnecessarily.
+    Uses CLAHE instead of global equalizeHist to avoid over-brightening
+    plates that already have decent contrast.
+    """
+    h = crop_bgr.shape[0]
+    if h < target_h:
+        scale = target_h / h
+        crop_bgr = cv2.resize(
+            crop_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        )
+
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    return clahe.apply(gray)
 
 
 def recognize_plate(
-    reader: easyocr.Reader,
+    engine: OcrEngine,
     crop_bgr,
     min_conf: float,
-) -> str:
-    """Run EasyOCR on a plate crop and return the best combined string."""
-    results = reader.readtext(crop_bgr)
-    parts: list[str] = []
-    for _bbox, text, conf in results:
-        if conf >= min_conf and text.strip():
-            parts.append(text.strip())
-    return clean_plate_text(" ".join(parts))
+    preprocess: bool = False,
+) -> tuple[str, float]:
+    """Run the OCR engine on a plate crop; return (cleaned text, mean confidence).
+
+    When preprocess=True, runs OCR on both the raw crop and a preprocessed
+    (upscaled + denoised + contrast-enhanced) version, returning whichever
+    yields higher confidence. When False, runs OCR on the raw crop only.
+    Engine-agnostic: works with any OcrEngine adapter.
+    """
+    def _ocr(img) -> tuple[str, float]:
+        parts, confs = [], []
+        for text, conf in engine.read(img):
+            if conf >= min_conf and text.strip():
+                parts.append(text.strip())
+                confs.append(conf)
+        avg = sum(confs) / len(confs) if confs else 0.0
+        return clean_plate_text(" ".join(parts)), avg
+
+    text_raw, conf_raw = _ocr(crop_bgr)
+
+    if not preprocess:
+        return text_raw, conf_raw
+
+    text_pre, conf_pre = _ocr(preprocess_plate(crop_bgr))
+    return (text_pre, conf_pre) if conf_pre >= conf_raw else (text_raw, conf_raw)
 
 
 def draw_detection(frame, box: tuple[int, int, int, int], label: str) -> None:
@@ -214,15 +469,16 @@ def draw_detection(frame, box: tuple[int, int, int, int], label: str) -> None:
 def process_frame(
     frame,
     yolo: YOLO,
-    reader: easyocr.Reader,
+    engine: OcrEngine,
     conf: float,
     ocr_conf: float,
     tracker: PlateTracker | None,
-) -> list[tuple[tuple[int, int, int, int], str]]:
-    """Detect plates, OCR crops, return list of (box, text)."""
+    preprocess: bool = False,
+) -> list[Detection]:
+    """Detect plates, OCR crops, return list of Detection objects."""
     h, w = frame.shape[:2]
     results = yolo.predict(frame, conf=conf, verbose=False)
-    detections: list[tuple[tuple[int, int, int, int], str]] = []
+    detections: list[Detection] = []
 
     if not results or results[0].boxes is None:
         return detections
@@ -239,11 +495,18 @@ def process_frame(
         if crop.size == 0:
             continue
 
-        text = recognize_plate(reader, crop, ocr_conf)
+        yolo_conf = float(box.conf[0].cpu().numpy())
+        text, ocr_conf_val = recognize_plate(engine, crop, ocr_conf, preprocess)
         plate_box = (x1, y1, x2, y2)
         if tracker is not None:
-            text = tracker.update(plate_box, text)
-        detections.append((plate_box, text))
+            text = tracker.update(plate_box, text, ocr_conf_val)
+        detections.append(Detection(
+            box=plate_box,
+            text=text,
+            yolo_conf=yolo_conf,
+            ocr_conf=ocr_conf_val,
+            crop=crop.copy(),
+        ))
 
     return detections
 
@@ -270,33 +533,43 @@ def open_capture(source_type: str, source_value: int | str, width: int, height: 
 
 def log_frame_detections(
     plate_log: PlateLog | None,
-    detections: list[tuple[tuple[int, int, int, int], str]],
+    evidence: EvidenceStore | None,
+    detections: list[Detection],
+    frame,
 ) -> None:
-    if plate_log is None:
-        return
-    plate_log.begin_frame()
+    if plate_log is not None:
+        plate_log.begin_frame()
+    if evidence is not None:
+        evidence.begin_frame()
+
     seen_text: set[str] = set()
-    for _box, text in detections:
-        if text and text not in seen_text:
-            plate_log.record(text)
-            seen_text.add(text)
+    for det in detections:
+        if not det.text or det.text in seen_text:
+            continue
+        seen_text.add(det.text)
+        if plate_log is not None:
+            plate_log.record(det.text)
+        if evidence is not None:
+            evidence.save(det, frame)
 
 
 def run_stream(
     cap: cv2.VideoCapture,
     yolo: YOLO,
-    reader: easyocr.Reader,
+    engine: OcrEngine,
     window_name: str,
     conf: float,
     ocr_conf: float,
     skip_frames: int,
     use_tracker: bool,
     plate_log: PlateLog | None,
+    evidence: EvidenceStore | None,
+    preprocess: bool = False,
 ) -> None:
     tracker = PlateTracker() if use_tracker else None
     frame_idx = 0
     prev_time = time.perf_counter()
-    last_detections: list[tuple[tuple[int, int, int, int], str]] = []
+    last_detections: list[Detection] = []
 
     print("Press 'q' in the video window to quit.")
     if plate_log is not None and plate_log.csv_path is not None:
@@ -312,17 +585,17 @@ def run_stream(
             frame_idx += 1
             if skip_frames > 0 and frame_idx % (skip_frames + 1) != 1:
                 display = frame.copy()
-                for box, text in last_detections:
-                    draw_detection(display, box, text)
+                for det in last_detections:
+                    draw_detection(display, det.box, det.text)
             else:
                 last_detections = process_frame(
-                    frame, yolo, reader, conf, ocr_conf, tracker
+                    frame, yolo, engine, conf, ocr_conf, tracker, preprocess
                 )
                 display = frame.copy()
-                for box, text in last_detections:
-                    draw_detection(display, box, text)
+                for det in last_detections:
+                    draw_detection(display, det.box, det.text)
 
-            log_frame_detections(plate_log, last_detections)
+            log_frame_detections(plate_log, evidence, last_detections, frame)
 
             now = time.perf_counter()
             fps = 1.0 / max(now - prev_time, 1e-6)
@@ -350,22 +623,24 @@ def run_stream(
 def run_image(
     path: str,
     yolo: YOLO,
-    reader: easyocr.Reader,
+    engine: OcrEngine,
     conf: float,
     ocr_conf: float,
     output: str | None,
     plate_log: PlateLog | None,
+    evidence: EvidenceStore | None,
+    preprocess: bool = False,
 ) -> None:
     frame = cv2.imread(path)
     if frame is None:
         raise RuntimeError(f"Failed to read image: {path}")
 
-    detections = process_frame(frame, yolo, reader, conf, ocr_conf, tracker=None)
-    log_frame_detections(plate_log, detections)
-    for box, text in detections:
-        draw_detection(frame, box, text)
+    detections = process_frame(frame, yolo, engine, conf, ocr_conf, tracker=None, preprocess=preprocess)
+    log_frame_detections(plate_log, evidence, detections, frame)
+    for det in detections:
+        draw_detection(frame, det.box, det.text)
         if not plate_log:
-            print(f"Plate: {text or '(no text)'}")
+            print(f"Plate: {det.text or '(no text)'}")
 
     if not detections:
         print("No license plates detected.")
@@ -407,7 +682,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-gpu",
         action="store_true",
-        help="Force CPU for EasyOCR (YOLO still uses Ultralytics default device)",
+        help="Force CPU for OCR (YOLO still uses Ultralytics default device)",
+    )
+    p.add_argument(
+        "--ocr-engine",
+        choices=["easyocr", "paddle"],
+        default="easyocr",
+        help="OCR backend to use: easyocr (default) or paddle (requires: pip install paddleocr paddlepaddle)",
     )
     p.add_argument(
         "--width",
@@ -428,9 +709,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run detection every N+1 frames (1=every other frame) for speed",
     )
     p.add_argument(
-        "--no-track",
+        "--track",
         action="store_true",
-        help="Disable multi-frame OCR voting (images only benefit little)",
+        help="Enable multi-frame IoU-based OCR stabilizer (useful for moving cars)",
     )
     p.add_argument(
         "--output",
@@ -448,6 +729,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable CSV logging and plate summary",
     )
+    p.add_argument(
+        "--preprocess",
+        action="store_true",
+        help=(
+            "Preprocess plate crops before OCR: upscale small crops, "
+            "denoise with bilateral filter, enhance contrast with CLAHE. "
+            "Runs OCR twice (raw + preprocessed) and picks the higher-confidence result. "
+            "Improves accuracy on small/blurry plates at the cost of ~2x OCR time per plate."
+        ),
+    )
+    p.add_argument(
+        "--save-evidence",
+        action="store_true",
+        help="Save plate crop + full frame images and a per-event detections CSV",
+    )
+    p.add_argument(
+        "--evidence-dir",
+        default="captures",
+        metavar="DIR",
+        help="Directory for evidence images (default: captures/)",
+    )
+    p.add_argument(
+        "--detections-csv",
+        default="detections_log.csv",
+        metavar="PATH",
+        help="Per-event CSV with confidence and image paths (default: detections_log.csv)",
+    )
+    p.add_argument(
+        "--max-captures",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Stop saving evidence after N events (0 = unlimited)",
+    )
     return p
 
 
@@ -462,7 +777,7 @@ def main() -> int:
         return 1
 
     try:
-        yolo, reader = init_models(args.model, ["en"], use_gpu)
+        yolo, engine = init_models(args.model, args.ocr_engine, ["en"], use_gpu)
     except Exception as exc:
         print(f"Failed to load models: {exc}", file=sys.stderr)
         return 1
@@ -471,29 +786,42 @@ def main() -> int:
     if not args.no_csv:
         plate_log = PlateLog(Path(args.csv))
 
+    evidence: EvidenceStore | None = None
+    if args.save_evidence:
+        evidence = EvidenceStore(
+            evidence_dir=Path(args.evidence_dir),
+            detections_csv=Path(args.detections_csv),
+            max_captures=args.max_captures,
+        )
+        print(f"Evidence capture enabled → {Path(args.evidence_dir).resolve()}")
+
     try:
         if source_type == "image":
             run_image(
                 source_value,
                 yolo,
-                reader,
+                engine,
                 args.conf,
                 args.ocr_conf,
                 args.output,
                 plate_log,
+                evidence,
+                args.preprocess,
             )
         else:
             cap = open_capture(source_type, source_value, args.width, args.height)
             run_stream(
                 cap,
                 yolo,
-                reader,
+                engine,
                 "ALPR",
                 args.conf,
                 args.ocr_conf,
                 args.skip_frames,
-                use_tracker=not args.no_track,
+                use_tracker=args.track,
                 plate_log=plate_log,
+                evidence=evidence,
+                preprocess=args.preprocess,
             )
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)

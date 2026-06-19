@@ -1,0 +1,11 @@
+git status
+git add <files>
+git commit -m "message"
+git checkout -b <new branch name> origin/master
+git checkout <branch name to switch to>
+git pull
+git diff <file>
+git log (show commits)
+git show <commit hash>
+git branch
+git branch -D <branch name>
