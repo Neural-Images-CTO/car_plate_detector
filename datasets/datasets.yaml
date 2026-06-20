@@ -1,0 +1,26 @@
+# Dataset registry for evaluate.py
+#
+# Register one or more dataset directories here. Add more entries over time
+# (e.g. a Roboflow export, frames captured from your deployment camera, etc.).
+#
+# Each entry:
+#   name:         unique label (used in console output and result filenames)
+#   path:         directory containing images (searched recursively;
+#                 extensions: .jpg .jpeg .png .bmp .webp .tif .tiff)
+#   ground_truth: OPTIONAL path to a CSV with columns `filename,plate_number`
+#                 where `filename` is relative to `path`.
+#                   - present -> evaluate.py SCORES predictions
+#                     (exact-match accuracy, character accuracy, detection rate)
+#                   - absent  -> evaluate.py BATCH-RUNS
+#                     (dumps annotated images + a predictions CSV, no scoring)
+#
+# Paths are resolved relative to the current working directory (run from repo root).
+
+datasets:
+  - name: mock
+    path: datasets/mock/images
+    ground_truth: datasets/mock/ground_truth.csv
+  - name: roboflow_il
+    path: C:/src/DATASETS/valid/images
+  # - name: camera_capture          # no ground_truth -> batch-run only
+  #   path: datasets/camera_capture/images

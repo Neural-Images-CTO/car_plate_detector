@@ -1,0 +1,5 @@
+filename,plate_number
+# Ground-truth template. One row per image in datasets/mock/images/.
+# `filename` is relative to the dataset `path`; `plate_number` is the true plate.
+# Example (delete these comment lines and the sample row when adding real data):
+# car001.jpg,12345678

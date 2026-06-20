@@ -6,6 +6,35 @@
 
 11/6 22:00-22:30: solving technical issue with git permissions for Shada
 
+15/6 22:00-23:00: thinking about how to enhance the model
 
+16/6 22:00-23:30: enhance stablizor by matching boxes using IoU (Intersection over Union) — a measure of how much two boxes overlap. If two boxes from consecutive frames overlap significantly (e.g. IoU > 0.4), they're considered the same plate, even if the coordinates shifted.
 
+19/6 21:30-22:30: implemented evidence capture — saves plate crop + full frame images per detection event, per-event detections_log.csv with yolo_conf, ocr_conf, and image paths. Added --save-evidence, --evidence-dir, --detections-csv, --max-captures CLI flags.
+
+19/6 22:30-23:00: reviewed vehicle detection + tracking enhancement proposal (3 stages: fix tracker key, ByteTrack, two-model pipeline). Documented in VEHICLE_TRACKING_ENHANCEMENT.md and added to TODO.
+
+20/6 00:00-00:30: implemented plate crop preprocessing (upscale + bilateral filter + CLAHE contrast enhancement). Runs OCR on both raw and preprocessed crop, picks higher confidence. Added --preprocess CLI flag (off by default).
+
+20/6 00:30-01:00: reviewed CSRT motion tracking + conditional OCR proposal. Documented in CSRT_MOTION_TRACKING.md, updated VEHICLE_TRACKING_ENHANCEMENT.md and TODO. Reviewed perspective correction proposal, documented in PERSPECTIVE_CORRECTION.md.
+
+20/6 01:00-01:15: implemented confidence-weighted voting in PlateTracker — instead of majority vote by count, sums OCR confidence scores per candidate text and picks the highest-scoring one.
+
+20/6 01:15-01:30: implemented pluggable OCR engine abstraction — OcrEngine protocol with EasyOcrEngine and PaddleOcrEngine adapters. Added --ocr-engine CLI flag (easyocr default, paddle optional). Updated README.
+
+20/6 1:30-2:00: trying to run with ocrpaddle
+
+20/6 11:39-12:00: analyzed the full codebase — reviewed detection, OCR, and tracking pipeline. Identified main accuracy limiters: no plate format validation, general-purpose OCR (not plate-specialized), no testing framework. Researched Israeli plate formats (numeric only, 7-8 digits).
+
+20/6 12:00-12:30: researched best open-source plate OCR (found fast-plate-ocr), searched for public Israeli plate datasets (Roboflow 472 imgs, HF 190 imgs, LPRIL). Created the implementation plan: Israeli validator + digit-restricted OCR + fast-plate-ocr engine + dataset registry + evaluation harness.
+
+20/6 12:30-13:00: implemented country-aware plate validation (PlateFormat + PLATE_FORMATS registry, --country flag), digit allowlist in EasyOcrEngine, FastPlateOcrEngine adapter, dataset registry (datasets.yaml + mock dir), evaluation harness (evaluate.py with batch-run and scoring modes). Updated README.
+
+20/6 13:00-13:30: downloaded Roboflow "Israel License Plates" dataset (YOLOv8 format, 72 validation images) to C:\src\DATASETS\valid\images. Configured dataset registry entry. Ran first evaluation with EasyOCR: only 8/72 valid plates (44% OCR returned nothing). Diagnosed OCR as the bottleneck, not detection.
+
+20/6 13:30-14:00: installed fast-plate-ocr[onnx-gpu] in local_alpr env. Fixed Windows SSL cert bug (ASN1: NOT_ENOUGH_DATA) by patching SSL context to use certifi. Ran fastplate evaluation: 56/72 valid plates — 7x improvement over EasyOCR. Side-by-side comparison confirmed fastplate as the clear winner.
+
+20/6 14:00-15:00: upgraded evaluate.py to multi-plate-per-image support — one row per detection in CSV (was single best-plate only), multi-row ground truth loading, greedy per-plate matcher for scoring. Added --emit-truth-template flag to generate pre-filled ground truth CSV. Generated template for roboflow_il (87 rows, 13 multi-plate images). Fixed output dir to C:\src\DATASETS\eval_output_fastplate.
+
+20/6 15:00-16:39: building ground truth by correcting predictions in the template CSV against annotated images.
 

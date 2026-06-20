@@ -1,3 +1,7 @@
+Add plate format validation
+
+________________
+
 run using camera tuning
 
 ________________
@@ -33,4 +37,26 @@ ________________
 
 future enhancements:
 see docs\roi-motion-gating.md
+
+________________
+
+vehicle detection + tracking enhancement:
+see VEHICLE_TRACKING_ENHANCEMENT.md
+
+  Stage 1   (small):        fix tracker key to vehicle body box instead of plate box
+  Stage 1.5 (small-medium): CSRT motion tracking on skipped frames + conditional OCR
+                             see CSRT_MOTION_TRACKING.md
+  Stage 2   (medium):       replace yolo.predict() with yolo.track() — ByteTrack, supersedes stage 1.5
+  Stage 3   (large):        add second YOLOv8 COCO vehicle detector, run plate detector inside vehicle crop only
+
+________________
+
+perspective correction (do after vehicle tracking):
+see PERSPECTIVE_CORRECTION.md
+
+  - correct angled/skewed plate crops before OCR using homography
+  - Option A (recommended): swap to a keypoint YOLO model that returns 4 plate corners
+  - Option B: contour detection on the crop to find the plate quadrilateral
+  - add --perspective CLI flag (off by default)
+  - only worth prioritising if camera is steep-angle and angled plates are the main OCR failure mode
 
