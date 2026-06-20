@@ -24,5 +24,17 @@
 
 20/6 1:30-2:00: trying to run with ocrpaddle
 
+20/6 11:39-12:00: analyzed the full codebase — reviewed detection, OCR, and tracking pipeline. Identified main accuracy limiters: no plate format validation, general-purpose OCR (not plate-specialized), no testing framework. Researched Israeli plate formats (numeric only, 7-8 digits).
 
+20/6 12:00-12:30: researched best open-source plate OCR (found fast-plate-ocr), searched for public Israeli plate datasets (Roboflow 472 imgs, HF 190 imgs, LPRIL). Created the implementation plan: Israeli validator + digit-restricted OCR + fast-plate-ocr engine + dataset registry + evaluation harness.
+
+20/6 12:30-13:00: implemented country-aware plate validation (PlateFormat + PLATE_FORMATS registry, --country flag), digit allowlist in EasyOcrEngine, FastPlateOcrEngine adapter, dataset registry (datasets.yaml + mock dir), evaluation harness (evaluate.py with batch-run and scoring modes). Updated README.
+
+20/6 13:00-13:30: downloaded Roboflow "Israel License Plates" dataset (YOLOv8 format, 72 validation images) to C:\src\DATASETS\valid\images. Configured dataset registry entry. Ran first evaluation with EasyOCR: only 8/72 valid plates (44% OCR returned nothing). Diagnosed OCR as the bottleneck, not detection.
+
+20/6 13:30-14:00: installed fast-plate-ocr[onnx-gpu] in local_alpr env. Fixed Windows SSL cert bug (ASN1: NOT_ENOUGH_DATA) by patching SSL context to use certifi. Ran fastplate evaluation: 56/72 valid plates — 7x improvement over EasyOCR. Side-by-side comparison confirmed fastplate as the clear winner.
+
+20/6 14:00-15:00: upgraded evaluate.py to multi-plate-per-image support — one row per detection in CSV (was single best-plate only), multi-row ground truth loading, greedy per-plate matcher for scoring. Added --emit-truth-template flag to generate pre-filled ground truth CSV. Generated template for roboflow_il (87 rows, 13 multi-plate images). Fixed output dir to C:\src\DATASETS\eval_output_fastplate.
+
+20/6 15:00-16:39: building ground truth by correcting predictions in the template CSV against annotated images.
 
