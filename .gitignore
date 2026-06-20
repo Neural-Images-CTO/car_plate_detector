@@ -1,4 +1,6 @@
 logs/
+eval_output/
+captures/
 __pycache__/
 *.pyc
 *.pyo

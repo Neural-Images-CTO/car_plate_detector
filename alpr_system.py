@@ -3,7 +3,8 @@
 Local Automatic License Plate Recognition (ALPR) using YOLOv8 + pluggable OCR.
 
 Supports webcam/camera (integer source), static images, and video files.
-OCR engine is selectable via --ocr-engine: easyocr (default) or paddle.
+OCR engine is selectable via --ocr-engine: easyocr (default), paddle, or fastplate.
+Plate-format rules are selectable via --country (e.g. 'il' for Israeli numeric plates).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 import cv2
 import torch
@@ -62,6 +63,56 @@ def clean_plate_text(raw: str) -> str:
     text = re.sub(r"[^A-Z0-9\- ]", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+@dataclass
+class PlateFormat:
+    """Country-specific plate rules.
+
+    `allowlist` is the set of characters the OCR engine may emit ("" = no
+    restriction; useful for alphanumeric plates). `validate` normalizes a raw
+    OCR string and reports whether it matches a plausible plate pattern.
+
+    Adding a new country is a single registry entry: provide an allowlist and a
+    validate function. To support non-digit (alphanumeric) plates later, widen
+    the allowlist (e.g. "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") and supply a
+    validator that encodes that country's pattern.
+    """
+
+    name: str
+    allowlist: str
+    validate: Callable[[str], tuple[str, bool]]
+
+
+def _validate_israeli(raw: str) -> tuple[str, bool]:
+    """Israeli civil plates are digits only.
+
+    8 digits -> XXX-XX-XXX (since 2017), 7 -> XX-XXX-XX (1980-2017),
+    5-6 -> legacy formats. Any other length is rejected so the stabilizer keeps
+    waiting for a plausible reading instead of locking onto garbage.
+    """
+    digits = re.sub(r"\D", "", raw)
+    n = len(digits)
+    if n == 8:
+        return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}", True
+    if n == 7:
+        return f"{digits[:2]}-{digits[2:5]}-{digits[5:]}", True
+    if n in (5, 6):
+        return f"{digits[:-3]}-{digits[-3:]}", True
+    return digits, False
+
+
+def _validate_passthrough(raw: str) -> tuple[str, bool]:
+    """No country rules: accept any non-empty alphanumeric reading as-is."""
+    text = clean_plate_text(raw)
+    return text, bool(text)
+
+
+# Registry of plate-format rules. Add new countries here.
+PLATE_FORMATS: dict[str, PlateFormat] = {
+    "il": PlateFormat("il", "0123456789", _validate_israeli),
+    "none": PlateFormat("none", "", _validate_passthrough),
+}
 
 
 @dataclass
@@ -298,15 +349,25 @@ class OcrEngine(Protocol):
 
 
 class EasyOcrEngine:
-    """Adapter for EasyOCR. Imported lazily so PaddleOCR installs are optional."""
+    """Adapter for EasyOCR. Imported lazily so PaddleOCR installs are optional.
 
-    def __init__(self, languages: list[str], gpu: bool) -> None:
+    An optional `allowlist` restricts which characters EasyOCR may emit. For
+    numeric-only plates (e.g. Israeli) pass "0123456789" to eliminate the most
+    common OCR errors (letter/digit confusion). Empty string = no restriction.
+    """
+
+    def __init__(self, languages: list[str], gpu: bool, allowlist: str = "") -> None:
         import easyocr  # noqa: PLC0415
         print("Loading EasyOCR reader (first run may download models)...")
         self._reader = easyocr.Reader(languages, gpu=gpu)
+        self._allowlist = allowlist
 
     def read(self, img) -> list[tuple[str, float]]:
-        return [(text, float(conf)) for _bbox, text, conf in self._reader.readtext(img)]
+        kwargs = {"allowlist": self._allowlist} if self._allowlist else {}
+        return [
+            (text, float(conf))
+            for _bbox, text, conf in self._reader.readtext(img, **kwargs)
+        ]
 
 
 class PaddleOcrEngine:
@@ -359,6 +420,62 @@ class PaddleOcrEngine:
         return out
 
 
+class FastPlateOcrEngine:
+    """Adapter for fast-plate-ocr (plate-specialized OCR).
+
+    Install with: pip install "fast-plate-ocr[onnx-gpu]"
+    Uses a model trained specifically on license plates, which is typically more
+    accurate than general scene-text OCR (EasyOCR/Paddle) on small/angled plates.
+    The default `cct-s-v2-global-model` covers 65+ countries.
+    """
+
+    def __init__(self, model: str = "cct-s-v2-global-model") -> None:
+        # fast-plate-ocr downloads weights via urllib. On Windows, a malformed
+        # cert in the system store can break urllib's default SSL context
+        # ([ASN1: NOT_ENOUGH_DATA]). Point the default HTTPS context at certifi's
+        # CA bundle so the (first-run) model download succeeds.
+        try:
+            import ssl  # noqa: PLC0415
+            import certifi  # noqa: PLC0415
+            ssl._create_default_https_context = lambda *a, **k: ssl.create_default_context(
+                cafile=certifi.where()
+            )
+        except Exception:
+            pass
+
+        from fast_plate_ocr import LicensePlateRecognizer  # noqa: PLC0415
+        print(f"Loading fast-plate-ocr model '{model}' (first run may download)...")
+        self._recognizer = LicensePlateRecognizer(model)
+
+    def read(self, img) -> list[tuple[str, float]]:
+        # Model expects uint8, channels_last, RGB arrays; crops here are OpenCV BGR.
+        if img is None or getattr(img, "size", 0) == 0:
+            return []
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if getattr(img, "ndim", 0) == 3 else img
+        try:
+            preds = self._recognizer.run(rgb, return_confidence=True)
+        except Exception as e:
+            print(f"[fast-plate-ocr] run failed: {e}", file=sys.stderr)
+            return []
+
+        out: list[tuple[str, float]] = []
+        for pred in preds:
+            text = getattr(pred, "plate", "") or ""
+            probs = getattr(pred, "char_probs", None)
+            conf = 0.0
+            if probs is not None:
+                try:
+                    if hasattr(probs, "mean"):
+                        conf = float(probs.mean())
+                    elif len(probs):
+                        conf = float(sum(probs) / len(probs))
+                except Exception:
+                    conf = 0.0
+            if text:
+                out.append((text, conf))
+        return out
+
+
 def resolve_yolo_weights(model_arg: str) -> str:
     """Local .pt path, Hugging Face repo id, or direct URL -> filesystem path."""
     path = Path(model_arg)
@@ -377,6 +494,7 @@ def init_models(
     ocr_engine_name: str,
     languages: list[str],
     use_gpu: bool,
+    allowlist: str = "",
 ) -> tuple[YOLO, OcrEngine]:
     device = "cuda" if use_gpu and gpu_available() else "cpu"
     print(f"Using device: {device}")
@@ -388,8 +506,13 @@ def init_models(
     gpu = use_gpu and gpu_available()
     if ocr_engine_name == "paddle":
         engine: OcrEngine = PaddleOcrEngine(gpu=gpu)
+    elif ocr_engine_name == "fastplate":
+        # fast-plate-ocr models recognize alphanumeric plates; the allowlist
+        # (used by EasyOCR) does not apply, but the plate-format validator still
+        # filters readings downstream.
+        engine = FastPlateOcrEngine()
     else:
-        engine = EasyOcrEngine(languages=languages, gpu=gpu)
+        engine = EasyOcrEngine(languages=languages, gpu=gpu, allowlist=allowlist)
 
     return yolo, engine
 
@@ -474,6 +597,7 @@ def process_frame(
     ocr_conf: float,
     tracker: PlateTracker | None,
     preprocess: bool = False,
+    plate_format: PlateFormat | None = None,
 ) -> list[Detection]:
     """Detect plates, OCR crops, return list of Detection objects."""
     h, w = frame.shape[:2]
@@ -498,8 +622,20 @@ def process_frame(
         yolo_conf = float(box.conf[0].cpu().numpy())
         text, ocr_conf_val = recognize_plate(engine, crop, ocr_conf, preprocess)
         plate_box = (x1, y1, x2, y2)
+
+        if plate_format is not None:
+            formatted, is_valid = plate_format.validate(text)
+        else:
+            formatted, is_valid = text, bool(text)
+
         if tracker is not None:
-            text = tracker.update(plate_box, text, ocr_conf_val)
+            # Only valid-format readings get a vote; invalid ones pass an empty
+            # string so the stabilizer keeps its current best and waits for a
+            # plausible plate instead of locking onto malformed OCR.
+            text = tracker.update(plate_box, formatted if is_valid else "", ocr_conf_val)
+        else:
+            text = formatted
+
         detections.append(Detection(
             box=plate_box,
             text=text,
@@ -565,6 +701,7 @@ def run_stream(
     plate_log: PlateLog | None,
     evidence: EvidenceStore | None,
     preprocess: bool = False,
+    plate_format: PlateFormat | None = None,
 ) -> None:
     tracker = PlateTracker() if use_tracker else None
     frame_idx = 0
@@ -589,7 +726,7 @@ def run_stream(
                     draw_detection(display, det.box, det.text)
             else:
                 last_detections = process_frame(
-                    frame, yolo, engine, conf, ocr_conf, tracker, preprocess
+                    frame, yolo, engine, conf, ocr_conf, tracker, preprocess, plate_format
                 )
                 display = frame.copy()
                 for det in last_detections:
@@ -630,12 +767,16 @@ def run_image(
     plate_log: PlateLog | None,
     evidence: EvidenceStore | None,
     preprocess: bool = False,
+    plate_format: PlateFormat | None = None,
 ) -> None:
     frame = cv2.imread(path)
     if frame is None:
         raise RuntimeError(f"Failed to read image: {path}")
 
-    detections = process_frame(frame, yolo, engine, conf, ocr_conf, tracker=None, preprocess=preprocess)
+    detections = process_frame(
+        frame, yolo, engine, conf, ocr_conf, tracker=None,
+        preprocess=preprocess, plate_format=plate_format,
+    )
     log_frame_detections(plate_log, evidence, detections, frame)
     for det in detections:
         draw_detection(frame, det.box, det.text)
@@ -686,9 +827,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--ocr-engine",
-        choices=["easyocr", "paddle"],
+        choices=["easyocr", "paddle", "fastplate"],
         default="easyocr",
-        help="OCR backend to use: easyocr (default) or paddle (requires: pip install paddleocr paddlepaddle)",
+        help=(
+            "OCR backend: easyocr (default), paddle (requires: pip install paddleocr "
+            'paddlepaddle), or fastplate (requires: pip install "fast-plate-ocr[onnx-gpu]")'
+        ),
+    )
+    p.add_argument(
+        "--country",
+        choices=sorted(PLATE_FORMATS.keys()),
+        default="il",
+        help=(
+            "Plate-format rules: 'il' (Israeli, digits only -> restricts EasyOCR to "
+            "digits and validates length/format) or 'none' (no restriction/validation). "
+            "Default: il"
+        ),
     )
     p.add_argument(
         "--width",
@@ -776,8 +930,13 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
+    plate_format = PLATE_FORMATS[args.country]
+
     try:
-        yolo, engine = init_models(args.model, args.ocr_engine, ["en"], use_gpu)
+        yolo, engine = init_models(
+            args.model, args.ocr_engine, ["en"], use_gpu,
+            allowlist=plate_format.allowlist,
+        )
     except Exception as exc:
         print(f"Failed to load models: {exc}", file=sys.stderr)
         return 1
@@ -807,6 +966,7 @@ def main() -> int:
                 plate_log,
                 evidence,
                 args.preprocess,
+                plate_format,
             )
         else:
             cap = open_capture(source_type, source_value, args.width, args.height)
@@ -822,6 +982,7 @@ def main() -> int:
                 plate_log=plate_log,
                 evidence=evidence,
                 preprocess=args.preprocess,
+                plate_format=plate_format,
             )
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
